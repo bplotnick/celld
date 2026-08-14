@@ -43,6 +43,9 @@ pub struct Slot {
     /// can arrive afterwards. Entering one would be a bug in this module.
     worker: tokio::sync::Mutex<Option<js::Worker>>,
     turns: AtomicUsize,
+    /// Async executions affiliated with this isolate. Stateless requests and
+    /// cell events both keep this claim while suspended between JS turns so
+    /// retirement cannot free the promises they will re-enter.
     requests: AtomicUsize,
     /// The pool's admission bell, cloned into every slot so an
     /// `Affiliation` drop can ring it without holding the pool.
@@ -86,7 +89,7 @@ impl Slot {
         f(worker)
     }
 
-    /// Mark a request as living in this isolate. Held for the request's whole
+    /// Mark an async execution as living in this isolate. Held for its whole
     /// life, including while it is suspended, because its promise stays in
     /// this heap and every later turn must come back here.
     pub fn affiliate(self: &Arc<Self>) -> Affiliation {
@@ -135,7 +138,7 @@ impl Slot {
     }
 }
 
-/// A request's claim on the isolate that ran its first turn.
+/// An async execution's claim on the isolate that ran its first turn.
 pub struct Affiliation(Arc<Slot>);
 
 impl Affiliation {
@@ -468,3 +471,38 @@ const _: fn() = || {
     assert_send_sync::<Slot>();
     assert_send_sync::<Affiliation>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suspended_cell_event_blocks_reuse_after_residency_drops() {
+        let slot = Arc::new(Slot {
+            id: 0,
+            worker: tokio::sync::Mutex::new(None),
+            turns: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            freed: Arc::new(tokio::sync::Notify::new()),
+            cells: AtomicUsize::new(0),
+            retiring: AtomicBool::new(false),
+        });
+        let residency = slot.house();
+        // The event has completed one turn and is now awaiting I/O.
+        let event = residency.slot().affiliate();
+
+        // Ownership stops the cell while that event is suspended.
+        slot.retiring.store(true, Ordering::Relaxed);
+        drop(residency);
+
+        assert_eq!(slot.cells.load(Ordering::Relaxed), 0);
+        assert_eq!(slot.requests.load(Ordering::Relaxed), 1);
+        assert!(!slot.is_reusable());
+
+        // Only completing the suspended event makes the freed slot reusable.
+        drop(event);
+
+        assert_eq!(slot.requests.load(Ordering::Relaxed), 0);
+        assert!(slot.is_reusable());
+    }
+}

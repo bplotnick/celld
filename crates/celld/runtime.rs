@@ -557,14 +557,14 @@ impl RuntimeManager {
             parent: _,
         } = request;
         let request_id = request_id.context("resident Worker fetch requires a request id")?;
-        let isolate = self
+        let affiliation = self
             .cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(&cell)
             .filter(|handle| handle.epoch == epoch)
-            .map(|handle| handle.residency.slot().clone())
+            .map(|handle| handle.residency.slot().affiliate())
             .ok_or_else(|| anyhow!("cell runtime is not published at epoch {epoch}: {cell}"))?;
         // The Worker entry, run in the isolate that hosts the cell it will
         // route to, so `env.NS.get(ownScope)` resolves in-isolate instead of
@@ -587,7 +587,7 @@ impl RuntimeManager {
         };
         tokio::spawn(async move {
             let _inline_activity = inline_activity;
-            drive_worker_on_cell(isolate, job).await;
+            drive_worker_on_cell(affiliation, job).await;
         });
         receive
             .await
@@ -968,7 +968,7 @@ impl RuntimeManager {
             order,
             parent,
         } = request;
-        let isolate = self.cell_isolate(&cell)?;
+        let affiliation = self.cell_affiliation(&cell)?;
         let (reply, mut receive) = tokio::sync::oneshot::channel();
         let scope = cell.clone();
         let job = CellJob::Fetch {
@@ -990,7 +990,7 @@ impl RuntimeManager {
             }
         }
         tokio::spawn(drive_cell(
-            isolate,
+            affiliation,
             job,
             Some(self.alarm_reporter.clone()),
             parent,
@@ -1169,14 +1169,18 @@ impl RuntimeManager {
             .await
     }
 
-    /// The isolate a published cell's events run in.
-    fn cell_isolate(&self, cell: &str) -> anyhow::Result<Arc<crate::pool::Slot>> {
+    /// Pin the isolate a published cell's event runs in.
+    ///
+    /// A cell can lose ownership while an event is suspended between turns.
+    /// The residency then disappears, but this affiliation keeps maintenance
+    /// from freeing the isolate until the event has completely left it.
+    fn cell_affiliation(&self, cell: &str) -> anyhow::Result<crate::pool::Affiliation> {
         self.cells
             .lock()
             .expect("cell registry poisoned")
             .published
             .get(cell)
-            .map(|handle| handle.residency.slot().clone())
+            .map(|handle| handle.residency.slot().affiliate())
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
     }
 
@@ -1192,9 +1196,9 @@ impl RuntimeManager {
         receive: tokio::sync::oneshot::Receiver<anyhow::Result<T>>,
         dropped: &'static str,
     ) -> anyhow::Result<T> {
-        let isolate = self.cell_isolate(cell)?;
+        let affiliation = self.cell_affiliation(cell)?;
         tokio::spawn(drive_cell(
-            isolate,
+            affiliation,
             job,
             Some(self.alarm_reporter.clone()),
             None,
@@ -1703,7 +1707,9 @@ fn load_cell_isolate(config: Arc<WorkerConfig>) -> anyhow::Result<Worker> {
 /// The stateless `drive` loop, with the isolate named rather than admitted:
 /// this request must run *here*, because the cell it will route to lives
 /// here and routing to it in-isolate is the point.
-async fn drive_worker_on_cell(slot: Arc<crate::pool::Slot>, job: crate::WorkerJob) {
+async fn drive_worker_on_cell(affiliation: crate::pool::Affiliation, job: crate::WorkerJob) {
+    let slot = affiliation.slot().clone();
+    let _affiliation = affiliation;
     let remote = inbound_parent(&job);
     let trace = crate::telemetry::start_trace_with_parent(remote.as_ref());
     let span_started = trace.map(|_| (Instant::now(), crate::telemetry::now_unix_us()));
@@ -1772,11 +1778,13 @@ fn report_alarm_moves(report: &Option<AlarmReporter>, moves: Vec<(String, i64)>)
 /// a handler awaiting I/O stops neither its own cell's next event nor any
 /// other cell sharing the isolate.
 pub(crate) async fn drive_cell(
-    slot: Arc<crate::pool::Slot>,
+    affiliation: crate::pool::Affiliation,
     mut job: CellJob,
     report: Option<AlarmReporter>,
     parent: Option<crate::telemetry::TraceIds>,
 ) {
+    let slot = affiliation.slot().clone();
+    let _affiliation = affiliation;
     // Two calls a caller made back-to-back reach the cell in that order.
     // This is the only place that can hold it: everything upstream is a
     // race, and everything downstream has already been delivered. Held

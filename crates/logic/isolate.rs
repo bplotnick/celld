@@ -16,10 +16,11 @@
 //!   placement balances. It must count the queue, not just the runner: an
 //!   isolate serves one turn at a time, so "executing" never exceeds one
 //!   and could never signal that another isolate would help.
-//! - **requests** — requests affiliated with this isolate. A request runs
-//!   its first turn somewhere and its promise then lives in that isolate's
-//!   heap, so every later turn must come back. Affiliation is memory, not
-//!   CPU, and is what admission and shedding care about.
+//! - **requests** — async executions affiliated with this isolate. A
+//!   stateless request runs its first turn somewhere and its promise then
+//!   lives in that isolate's heap; a cell event similarly has to re-enter the
+//!   isolate holding its realm after an await. Affiliation is memory, not CPU,
+//!   and is what admission, shedding, and safe retirement care about.
 //!
 //! Everything here is a predicate over observed load. The shell reports what
 //! it sees and performs what it is told; it never decides.
@@ -36,8 +37,8 @@ pub struct IsolateLoad {
     /// outstanding work. Counting only the runner would cap this at one,
     /// since an isolate serves one turn at a time.
     pub turns: usize,
-    /// Requests whose JS state lives here, running or awaiting. Each one
-    /// pins a promise and its closures in this isolate's heap.
+    /// Async executions whose JS state lives here, running or awaiting. Each
+    /// one pins a promise and its closures in this isolate's heap.
     pub requests: usize,
     /// Cells hosted here: realms this isolate holds, one per cell.
     ///
