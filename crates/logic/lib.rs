@@ -4621,6 +4621,68 @@ pub fn on_event(state: &mut State, event: Event) -> Vec<Effect> {
     effects
 }
 
+#[cfg(test)]
+mod response_stream_repro_tests {
+    use super::*;
+
+    fn idle_state(idle_evict_ms: u64) -> State {
+        let mut state = State::new(
+            "node-a",
+            Config {
+                max_resident: 1,
+                max_activations: 1,
+                max_evictions: 1,
+                max_releases: 1,
+                max_outbound_websockets: 1,
+                ownership_on_evict: OwnershipOnEvict::Sticky,
+                require_node_lease: false,
+                peer_protocol: 1,
+                operation_deadline_ms: None,
+                alarm_resident_ms: 0,
+                idle_evict_ms: Some(idle_evict_ms),
+                pressure: pressure::PressureConfig::default(),
+            },
+        );
+        state.cells.insert(
+            "Sse:one".into(),
+            Cell {
+                phase: Phase::Resident { epoch: 1 },
+                last_used_mono_ms: 0,
+                ..Cell::default()
+            },
+        );
+        state.occupied = 1;
+        state
+    }
+
+    #[test]
+    fn response_body_chunks_do_not_refresh_the_idle_lease() {
+        let mut state = idle_state(1_000);
+
+        // The HTTP handler has already returned its streaming response. The
+        // application emits SSE heartbeats at 250, 500, and 750 ms, but celld
+        // has no Event representing a forwarded response-body chunk. Thus the
+        // decision core still sees last_used_mono_ms == 0 at the next sample.
+        let _heartbeats_forwarded_at_ms = [250, 500, 750];
+        let effects = on_event(
+            &mut state,
+            Event::LoadSampled {
+                load: pressure::Load {
+                    resident_cells: 1,
+                    rss_bytes: 0,
+                    in_use_bytes: 0,
+                },
+                now_mono_ms: 1_000,
+            },
+        );
+
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::EnsureDurable { cell, .. } if cell == "Sse:one"
+        )), "a live streaming response was selected for idle eviction");
+    }
+}
+
 fn same_node_lease(left: &NodeLeaseRecord, right: &NodeLeaseRecord) -> bool {
     left.node == right.node
         && left.addr == right.addr

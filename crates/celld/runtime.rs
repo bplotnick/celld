@@ -2224,3 +2224,123 @@ pub(crate) async fn drive_cell(
 fn path_text(path: &Path) -> &str {
     path.to_str().expect("celld data path must be UTF-8")
 }
+
+#[cfg(test)]
+mod response_stream_repro_tests {
+    use super::*;
+
+    #[test]
+    fn evicting_a_streaming_cell_orphans_the_response_body() {
+        init_v8();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let data_dir = tempfile::tempdir().unwrap();
+                let script = r#"
+                    export class Repro {
+                      fetch() {
+                        const encoder = new TextEncoder();
+                        const body = new ReadableStream({
+                          start(controller) {
+                            controller.enqueue(encoder.encode(": connected\n\n"));
+                            setInterval(
+                              () => controller.enqueue(encoder.encode(": ping\n\n")),
+                              10,
+                            );
+                          },
+                        });
+                        return new Response(body, {
+                          headers: {"content-type": "text/event-stream"},
+                        });
+                      }
+                    }
+                    export default { fetch() { return new Response("unused"); } };
+                "#;
+                let runtime = RuntimeManager::start(RuntimeOptions {
+                    worker: WorkerConfigOptions {
+                        src: script.to_string(),
+                        script_name: "repro".to_string(),
+                        do_classes: vec!["Repro".to_string()],
+                        bindings: Vec::new(),
+                        r2_bindings: Vec::new(),
+                        d1_bindings: Vec::new(),
+                        ai_binding: None,
+                        vars: Vec::new(),
+                        node: "test-node".to_string(),
+                        modules: Vec::new(),
+                        compat: js::Compat::default(),
+                    },
+                    crons: Vec::new(),
+                    services: Vec::new(),
+                    asset_binding: None,
+                    loader_binding: None,
+                    cohosted: Vec::new(),
+                    data_dir: data_dir.path().to_path_buf(),
+                    replication: None,
+                    wake: None,
+                    alarm_observer: Arc::new(|_, _| {}),
+                    node: "test-node".to_string(),
+                    region: "test-region".to_string(),
+                })
+                .unwrap();
+                let cell = "Repro:cell".to_string();
+                tokio::fs::create_dir_all(data_dir.path().join(&cell).join("ltx/e1"))
+                    .await
+                    .unwrap();
+                runtime.start_cell(cell.clone(), 1, true).await.unwrap();
+                runtime.publish_cell(&cell, 1).unwrap();
+
+                let response = runtime
+                    .fetch_cell(
+                        cell.clone(),
+                        None,
+                        RuntimeFetch {
+                            url: "http://cell.test/events".to_string(),
+                            method: "GET".to_string(),
+                            body: Vec::new(),
+                            headers: Vec::new(),
+                            request_id: None,
+                            order: None,
+                            parent: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let mut body = response.stream.expect("expected a streamed response");
+                let connected = tokio::time::timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .expect("stream never started")
+                    .expect("stream closed before its first frame")
+                    .expect("stream failed before its first frame");
+                assert_eq!(connected, b": connected\n\n");
+                let ping = tokio::time::timeout(Duration::from_secs(2), body.next())
+                    .await
+                    .expect("heartbeat was not emitted")
+                    .expect("stream closed before its heartbeat")
+                    .expect("stream failed before its heartbeat");
+                assert_eq!(ping, b": ping\n\n");
+
+                runtime.stop_cell(&cell, 1, true, true).await;
+                runtime.cell_isolates["repro"].reap_empty();
+
+                // This is the desired transport contract and fails on the
+                // current implementation. Depending on isolate-reaping timing,
+                // current celld either keeps yielding orphaned chunks or leaves
+                // the body pending forever; it does not produce a clean EOF.
+                let closed = tokio::time::timeout(Duration::from_millis(250), async {
+                    loop {
+                        match body.next().await {
+                            None => return,
+                            Some(Ok(_orphaned_chunk)) => continue,
+                            Some(Err(error)) => panic!("stream failed instead of closing: {error}"),
+                        }
+                    }
+                })
+                .await;
+                assert!(closed.is_ok(), "eviction left the response body open");
+            });
+    }
+}
