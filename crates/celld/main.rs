@@ -426,7 +426,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
             let (node, addr, epoch, peer_protocol) = match route {
                 Route::Local => {
                     let dispatch_started = Instant::now();
-                    let _activity = app.activity(request, scope.clone());
+                    let activity = app.activity(request, scope.clone());
                     let result = async {
                         let runtime = app.runtime.as_ref().context("no cell runtime")?;
                         let response = runtime
@@ -476,6 +476,7 @@ async fn dispatch_do_call(app: AppHandle, call: DoCallReq) {
                         Ok(response) => Ok(response),
                         Err(error) => Err(error),
                     };
+                    let result = result.map(|response| response.hold_activity(activity));
                     if let Some(timing) = websocket_timing.as_mut() {
                         timing.dispatch_us = timing
                             .dispatch_us
@@ -1066,7 +1067,7 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
             request,
             route: Route::Local,
         }) => {
-            let _activity = app.activity(request, scope.clone());
+            let activity = app.activity(request, scope.clone());
             let Some(runtime) = &app.runtime else {
                 return response(StatusCode::SERVICE_UNAVAILABLE, "no cell runtime");
             };
@@ -1137,7 +1138,7 @@ async fn internal_do(request: Request<Incoming>, app: AppHandle, scope: String) 
                             ));
                         }
                     }
-                    peer_runtime_response(worker_response)
+                    peer_runtime_response(worker_response.hold_activity(activity))
                 }
                 Err(error) => response(
                     StatusCode::INTERNAL_SERVER_ERROR,

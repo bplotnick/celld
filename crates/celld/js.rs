@@ -690,6 +690,48 @@ pub struct HttpResponse {
     pub write_position: Option<u64>,
 }
 
+impl HttpResponse {
+    /// Keep a routed cell request active until its streaming response is no
+    /// longer being consumed. Returning the response head does not finish a
+    /// Durable Object request: Cloudflare keeps the object active for the
+    /// lifetime of the body, and celld must do the same so an SSE stream does
+    /// not become eligible for idle eviction between chunks.
+    pub fn hold_activity<T>(mut self, activity: T) -> Self
+    where
+        T: Send + Unpin + 'static,
+    {
+        let Some(stream) = self.stream.take() else {
+            drop(activity);
+            return self;
+        };
+        self.stream = Some(Box::pin(ActivityStream {
+            stream,
+            activity: Some(activity),
+        }));
+        self
+    }
+}
+
+struct ActivityStream<T> {
+    stream: HttpChunkStream,
+    activity: Option<T>,
+}
+
+impl<T: Unpin> futures_util::Stream for ActivityStream<T> {
+    type Item = Result<Vec<u8>, String>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let result = self.stream.as_mut().poll_next(cx);
+        if matches!(result, std::task::Poll::Ready(None)) {
+            self.activity.take();
+        }
+        result
+    }
+}
+
 /// Which alarm a dispatch runs, and who owns its bookkeeping.
 pub enum AlarmDispatch {
     /// Claim whatever is due now, and record the outcome. Production only
@@ -6259,4 +6301,56 @@ mod conformance_web_platform_tests {
 #[cfg(all(test, celld_internal_tests))]
 mod call_order_private {
     include!(env!("CELLD_CONFORMANCE_CALL_ORDER_TESTS"));
+}
+
+#[cfg(test)]
+mod response_activity_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropSignal(Arc<AtomicUsize>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn response(stream: Option<HttpChunkStream>) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: Vec::new(),
+            stream,
+            headers: Vec::new(),
+            ws: None,
+            write_position: None,
+        }
+    }
+
+    #[test]
+    fn streaming_response_holds_activity_until_body_closes() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let stream: HttpChunkStream = Box::pin(futures_util::stream::iter([Ok(Vec::new())]));
+        let mut response = response(Some(stream)).hold_activity(DropSignal(drops.clone()));
+        let mut stream = response.stream.take().unwrap();
+
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert!(stream.next().await.is_some());
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                assert!(stream.next().await.is_none());
+            });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn buffered_response_releases_activity_with_response_head() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let _response = response(None).hold_activity(DropSignal(drops.clone()));
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
 }

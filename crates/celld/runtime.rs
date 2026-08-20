@@ -167,6 +167,11 @@ struct CellHandle {
     /// `alarm()`'s point query. Written only by the effect path — a turn
     /// moves an alarm, its drive reports it — never by storage directly.
     next_alarm_ms: AtomicI64,
+    /// Every response body created by this activation subscribes here. A
+    /// forced stop closes those bodies before the realm and its stream
+    /// controllers disappear, so clients see an explicit EOF rather than a
+    /// truncated transport.
+    response_stop: tokio::sync::watch::Sender<bool>,
 }
 
 pub type AlarmObserver = Arc<dyn Fn(String, Option<i64>) + Send + Sync>;
@@ -1043,6 +1048,7 @@ impl RuntimeManager {
                     startup_us,
                     residency,
                     next_alarm_ms: AtomicI64::new(alarm.unwrap_or(-1)),
+                    response_stop: tokio::sync::watch::channel(false).0,
                 },
             );
             Ok(placed_in)
@@ -1109,6 +1115,11 @@ impl RuntimeManager {
             }
         }
         for handle in stopped {
+            // End response bodies while their realm still exists. Ordinary
+            // idle eviction cannot reach this path while a body holds its
+            // request active; shutdown, fencing, and handoff are allowed to
+            // force the stop and must make that termination explicit.
+            let _ = handle.response_stop.send(true);
             // Give the cell back rather than shutting the isolate down: it
             // serves other cells. Taking the isolate for this turn is the
             // barrier — an event of this cell either finished its turn
@@ -1161,7 +1172,7 @@ impl RuntimeManager {
             order,
             parent,
         } = request;
-        let isolate = self.cell_isolate(&cell)?;
+        let (isolate, mut response_stop) = self.cell_fetch_target(&cell)?;
         let (reply, mut receive) = tokio::sync::oneshot::channel();
         let scope = cell.clone();
         let job = CellJob::Fetch {
@@ -1212,7 +1223,15 @@ impl RuntimeManager {
         js::drain_arm_gates(&scope)
             .await
             .map_err(|error| anyhow!(error))?;
-        result
+        let mut response = result?;
+        if let Some(stream) = response.stream.take() {
+            response.stream = Some(Box::pin(stream.take_until(async move {
+                if !*response_stop.borrow() {
+                    let _ = response_stop.changed().await;
+                }
+            })));
+        }
+        Ok(response)
     }
 
     /// Tell a cell to abandon a fetch, by name.
@@ -1378,6 +1397,28 @@ impl RuntimeManager {
             .published
             .get(cell)
             .map(|handle| handle.residency.slot().affiliate())
+            .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
+    }
+
+    /// Atomically bind a fetch to both its isolate and its activation's
+    /// response-lifetime signal. Taking both under the registry lock closes
+    /// the race where a forced stop could remove the activation after dispatch
+    /// but before the returned stream subscribed.
+    fn cell_fetch_target(
+        &self,
+        cell: &str,
+    ) -> anyhow::Result<(crate::pool::Affiliation, tokio::sync::watch::Receiver<bool>)> {
+        self.cells
+            .lock()
+            .expect("cell registry poisoned")
+            .published
+            .get(cell)
+            .map(|handle| {
+                (
+                    handle.residency.slot().affiliate(),
+                    handle.response_stop.subscribe(),
+                )
+            })
             .ok_or_else(|| anyhow!("cell runtime is not published: {cell}"))
     }
 
@@ -2230,7 +2271,7 @@ mod response_stream_repro_tests {
     use super::*;
 
     #[test]
-    fn evicting_a_streaming_cell_orphans_the_response_body() {
+    fn forced_stop_closes_a_streaming_response_body_cleanly() {
         init_v8();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2326,10 +2367,9 @@ mod response_stream_repro_tests {
                 runtime.stop_cell(&cell, 1, true, true).await;
                 runtime.cell_isolates["repro"].reap_empty();
 
-                // This is the desired transport contract and fails on the
-                // current implementation. Depending on isolate-reaping timing,
-                // current celld either keeps yielding orphaned chunks or leaves
-                // the body pending forever; it does not produce a clean EOF.
+                // A forced stop is allowed to override response activity, but
+                // it must explicitly close the stream before tearing down the
+                // realm so the HTTP layer can finish compression cleanly.
                 let closed = tokio::time::timeout(Duration::from_millis(250), async {
                     loop {
                         match body.next().await {
